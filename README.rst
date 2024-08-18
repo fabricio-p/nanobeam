@@ -8,7 +8,7 @@ A small virtual machine aiming to replicate some of the capabilities of the glor
 TODO
 ----
 
-1. ☐ Make it **RUN** simple instruction
+1. ☑ Make it **RUN** simple instruction
 
 2. ☐ Make it **RUN** functions
 
