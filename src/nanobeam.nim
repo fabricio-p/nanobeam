@@ -1,20 +1,23 @@
-import macros
+import macros, tables, hashes, sugar
 
 import yarolin/options
 import fusion/matching
 
+import ./nanobeam/[io, string_view, arc, mutex]
+
 {.experimental: "caseStmtMacros".}
 
 type
-  StringView = object
-    p: ptr UncheckedArray[char]
-    l: int
+  MaxSeq[T] = object
+    cap, len: int
+    data: UncheckedArray[T]
 
-func toStringView(s: string): StringView =
-  StringView(p: cast[ptr UncheckedArray[char]](addr s[0]), l: s.len())
+func initMaxSeqInplace*[T](s: var MaxSeq[T], cap: int) =
+  s.cap = cap
+  s.len = 0
 
 type
-  OpCode {.size(1).} = enum
+  OpCode {.size: sizeof(uint8).} = enum
     LoadI
     LoadF
 
@@ -37,7 +40,7 @@ type
     else:
       discard
 
-  TermKind {.size(1).} = enum
+  TermKind {.size: sizeof(uint8).} = enum
     Int
     Float
 
@@ -48,12 +51,46 @@ type
     of Float:
       float: BiggestFloat
 
+  AtomValue = StringView
+  AtomDesc = distinct int
+  Atom = distinct uint32
+
+  PID = distinct uint32
+
+  Function = object
+    code: Slice[int]
+
+  Module = object
+    atomNames: seq[string]
+    functions: Table[Atom, Function]
+
+  Process {.byref.} = object
+    memory: Slice[pointer]
+    hTop, sTop: ptr Term
+    fcalls: int32
+    heap: Slice[ptr Term]
+
+    pc: ptr Instruction
+    reductions: uint
+    uniq: int64
+    # xRegs: ptr array[0..999, Term]
+    # yRegs: ptr MaxSeq[Term]
+    # 
+
   Env = object
-    regs: array[uint8.high, Term]
+    pidCounter: uint32
+    procTable: RWMutex[Table[PID, Arc[Process]]]
+    atomTable: RWMutex[Table[AtomDesc, Atom]]
+
+func hash(pid: PID): Hash {.borrow.}
+func hash(pid: AtomDesc): Hash {.borrow.}
 
 template genTermOperation(name: untyped, operator: untyped): untyped =
   bind TermKind
   bind Term
+  bind Option
+  bind some
+  bind none
   func `name`(lhs, rhs: Term): Option[Term] =
     if lhs.kind == Int and rhs.kind == Int:
       Term(kind: Int, int: `operator`(lhs.int, rhs.int)).some
@@ -85,22 +122,23 @@ genTermOperation(mul, `*`)
 genTermOperation(divide, divide)
 
 proc execute(env: var Env, instr: Instruction) =
-  case instr.opcode
-  of LoadI:
-    env.regs[instr.res] = Term(kind: Int, int: instr.valuei)
-  of LoadF:
-    env.regs[instr.res] = Term(kind: Float, float: instr.valuef)
-  of Add:
-    env.regs[instr.res] = env.regs[instr.op1].add(env.regs[instr.op2]).get()
-  of Sub:
-    env.regs[instr.res] = env.regs[instr.op1].sub(env.regs[instr.op2]).get()
-  of Mul:
-    env.regs[instr.res] = env.regs[instr.op1].mul(env.regs[instr.op2]).get()
-  of Div:
-    env.regs[instr.res] = env.regs[instr.op1].divide(env.regs[instr.op2]).get()
-  of Print:
-    let value = env.regs[instr.res]
-    echo "Value: ", value
+  discard
+  # case instr.opcode
+  # of LoadI:
+  #   env.regs[instr.res] = Term(kind: Int, int: instr.valuei)
+  # of LoadF:
+  #   env.regs[instr.res] = Term(kind: Float, float: instr.valuef)
+  # of Add:
+  #   env.regs[instr.res] = env.regs[instr.op1].add(env.regs[instr.op2]).get()
+  # of Sub:
+  #   env.regs[instr.res] = env.regs[instr.op1].sub(env.regs[instr.op2]).get()
+  # of Mul:
+  #   env.regs[instr.res] = env.regs[instr.op1].mul(env.regs[instr.op2]).get()
+  # of Div:
+  #   env.regs[instr.res] = env.regs[instr.op1].divide(env.regs[instr.op2]).get()
+  # of Print:
+  #   let value = env.regs[instr.res]
+  #   echo "Value: ", value
 
 proc main() =
   let program = @[
