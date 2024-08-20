@@ -6,10 +6,11 @@ type
     data: T
   Arc*[T] {.bycopy.} = distinct ptr ArcObj[T]
 
-proc new*[T](_: typedesc[Arc], value: T): Arc[T] =
+proc new*[T](_: typedesc[Arc], value: sink T): Arc[T] =
   let arcObj = createShared(ArcObj[T])
   arcObj.refc.store(1)
   arcObj.data = value
+  debugEcho "Arc.new(", value, ")"
   return Arc[T](arcObj)
 
 func get*[T](arc: Arc[T]): ptr ArcObj[T] = (ptr ArcObj[T]) arc
@@ -43,4 +44,5 @@ func `=move`*[T](
 ) {.error: "Arc[T] can be only copied, sinked, or destroyed".}
 
 func `=destroy`*[T](arc: Arc[T]) =
-  discard arc.countDec()
+  if not arc.get().isNil():
+    discard arc.countDec()

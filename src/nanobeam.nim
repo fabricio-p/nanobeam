@@ -1,4 +1,4 @@
-import macros, tables, hashes, sugar
+import macros, tables, hashes, sugar, os, random
 
 import yarolin/options
 import fusion/matching
@@ -8,13 +8,84 @@ import ./nanobeam/[io, string_view, arc, mutex]
 {.experimental: "caseStmtMacros".}
 
 type
-  MaxSeq[T] = object
-    cap, len: int
+  MaxSeqObj[T] = object
+    cap, len: Natural
     data: UncheckedArray[T]
 
+  MaxSeq[T] = distinct ptr MaxSeqObj[T]
+
+template align(x, alignment: int): int =
+  (x + alignment - 1) and not (alignment - 1)
+
+func get[T](ms: MaxSeq[T]): ptr MaxSeqObj[T] = (ptr MaxSeqObj[T]) ms
+
 func initMaxSeqInplace*[T](s: var MaxSeq[T], cap: int) =
-  s.cap = cap
-  s.len = 0
+  s.get.cap = cap
+  s.get.len = 0
+
+proc newMaxSeqOfCap*[T](cap: int = 8, shared: static[bool] = true): MaxSeq[T] =
+  let
+    cap = align(cap, 8)
+    size = sizeof(MaxSeqObj[T].cap) + sizeof(MaxSeqObj[T].len) + cap * sizeof(T)
+  when shared:
+    result = MaxSeq[T](
+      cast[ptr MaxSeqObj[T]](createShared(uint8, size))
+    )
+  else:
+    result = MaxSeq[T](
+      cast[ptr MaxSeqObj[T]](create(uint8, size))
+    )
+  result.get.cap = cap
+
+proc newMaxSeq*[T](len: int, shared: static[bool] = true): MaxSeq[T] =
+  result = newMaxSeqOfCap[T](len, shared)
+  result.get.len = len
+
+func len*(ms: MaxSeq[auto]): int = ms.get.len
+func low*(ms: MaxSeq[auto]): int = 0
+func high*(ms: MaxSeq[auto]): int = ms.get.len - 1
+
+template toOpenArray*[T](ms: MaxSeq[T]): openArray[T] =
+  bind MaxSeq
+  bind get
+  ms.get.data.addr.toOpenArray(0, ms.high.int)
+
+func `[]`*[T](ms: var MaxSeq[T], i: int): var T =
+  assert i < ms.len
+  ms.get.data[i]
+
+func `[]=`*[T](ms: var MaxSeq[T], i: int, value: T) =
+  assert i < ms.len
+  ms.get.data[i] = value
+
+func add*[T](ms: var MaxSeq[T], item: T) =
+  assert ms.len < ms.cap
+  ms.get.data[ms.get.len] = item
+  inc ms.get.len
+
+iterator items*[T](ms: MaxSeq[T]): T =
+  var i = 0
+  while i < ms.len:
+    yield ms.get.data[i]
+    inc i
+
+iterator mitems*[T](ms: var MaxSeq[T]): var T =
+  var i = 0
+  while i < ms.len:
+    yield ms[i]
+    inc i
+
+iterator pairs*[T](ms: MaxSeq[T]): (Natural, T) =
+  var i = 0
+  while i < ms.len:
+    yield (i, ms[i])
+    inc i
+
+iterator mpairs*[T](ms: var MaxSeq[T]): tuple[index: Natural, val: var T] =
+  var i = 0.Natural
+  while i < ms.len:
+    yield (i, ms[i])
+    inc i
 
 type
   OpCode {.size: sizeof(uint8).} = enum
@@ -61,8 +132,9 @@ type
     code: Slice[int]
 
   Module = object
+    name: Atom
     atomNames: seq[string]
-    functions: Table[Atom, Function]
+    functions: RWMutex[Table[Atom, Function]]
 
   Process {.byref.} = object
     memory: Slice[pointer]
@@ -77,13 +149,47 @@ type
     # yRegs: ptr MaxSeq[Term]
     # 
 
+  Scheduler = object
+    env: ptr Env
+    id: uint32
+
   Env = object
     pidCounter: uint32
+    queue: Channel[Arc[Process]]
+    schedulers: MaxSeq[Scheduler]
+    schedulerThreads: MaxSeq[Thread[ptr Scheduler]]
+    moduleTable: RWMutex[Table[Atom, Module]]
     procTable: RWMutex[Table[PID, Arc[Process]]]
     atomTable: RWMutex[Table[AtomDesc, Atom]]
 
 func hash(pid: PID): Hash {.borrow.}
 func hash(pid: AtomDesc): Hash {.borrow.}
+
+proc schedulerLoop(scheduler: ptr Scheduler) {.thread.} =
+  for i in 0..<10:
+    # let process = scheduler.env.queue.recv[:Arc[Process]]()
+    # discard process
+    {.cast(gcsafe).}:
+      stdout.write("[" & $scheduler.id & "]: " & $i & Endl)
+    sleep(rand(200..1000))
+
+proc init(env: var Env, numSchedulers: Natural, maxProcesses: Natural = 0) =
+  env.pidCounter = 0
+  env.queue.open(maxProcesses)
+  env.schedulers = newMaxSeq[Scheduler](numSchedulers)
+  env.schedulerThreads = newMaxSeq[Thread[ptr Scheduler]](numSchedulers)
+  for (i, scheduler) in env.schedulers.mpairs():
+    scheduler.env = addr env
+    scheduler.id = i.uint32
+    dump scheduler
+  for (i, schedulerThread) in env.schedulerThreads.mpairs():
+    createThread(schedulerThread, schedulerLoop, addr env.schedulers[i])
+  env.moduleTable.init(initTable[Atom, Module]())
+  env.procTable.init(initTable[PID, Arc[Process]]())
+  env.atomTable.init(initTable[AtomDesc, Atom]())
+
+proc runUntilEnd(env: var Env) =
+  joinThreads(env.schedulerThreads.toOpenArray())
 
 template genTermOperation(name: untyped, operator: untyped): untyped =
   bind TermKind
@@ -152,8 +258,8 @@ proc main() =
     Instruction(opcode: OpCode.Print, res: 0),
   ]
   var env: Env
-  for instr in program.items():
-    env.execute(instr)
+  env.init(2)
+  env.runUntilEnd()
 
 when isMainModule:
   main()

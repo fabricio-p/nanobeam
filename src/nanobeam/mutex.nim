@@ -26,20 +26,13 @@ func default*(
   _: typedesc[BasicMutex]
 ): BasicMutex {.error: "BasicMutex can not have a default value".}
 
-func new*[T, L](
-  _: typedesc[BasicMutex[T, L]],
-  data: T
-): BasicMutex[T, L] {.noinit.} =
-  result.lock.initLock()
-  result.data = data
+func init*[T](mutex: var Mutex[T], data: sink T) =
+  mutex.lock.initLock()
+  mutex.data = data
 
-func new*[T](_: typedesc[Mutex[T]], data: T): Mutex[T] {.noinit.} =
-  result.lock.initLock()
-  result.data = data
-
-func new*[T](_: typedesc[RWMutex[T]], data: T): RWMutex[T] {.noinit.} =
-  result.lock.initLock()
-  result.data = data
+func init*[T](mutex: var RWMutex[T], data: sink T) =
+  mutex.lock.initLock()
+  mutex.data = data
 
 func `[]`*[T, L](mutex: BasicMutex[T, L]): T =
   mutex.lock.acquire()
