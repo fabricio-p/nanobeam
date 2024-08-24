@@ -9,6 +9,10 @@ let
   cout* = newFileStream(stdout)
   cerr* = newFileStream(stderr)
 
+GC_ref(cin)
+GC_ref(cout)
+GC_ref(cerr)
+
 const
   Endl* = "\n"
 

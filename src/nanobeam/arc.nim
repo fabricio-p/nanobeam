@@ -6,20 +6,24 @@ type
     data: T
   Arc*[T] {.bycopy.} = distinct ptr ArcObj[T]
 
-proc new*[T](_: typedesc[Arc], value: sink T): Arc[T] =
+func get*[T](arc: Arc[T]): ptr ArcObj[T] = (ptr ArcObj[T]) arc
+
+proc newUnsafe*[T](_: typedesc[Arc]): Arc[T] =
   let arcObj = createShared(ArcObj[T])
   arcObj.refc.store(1)
-  arcObj.data = value
-  debugEcho "Arc.new(", value, ")"
-  return Arc[T](arcObj)
+  Arc[T](arcObj)
 
-func get*[T](arc: Arc[T]): ptr ArcObj[T] = (ptr ArcObj[T]) arc
+proc new*[T](_: typedesc[Arc], value: sink T): Arc[T] =
+  result = Arc.newUnsafe[:T]()
+  result.get().data = value
+  debugEcho "Arc.new(", value, ")"
 
 func countInc*[T](arc: Arc[T]): int32 =
   arc.get().refc.fetchAdd(1'i32)
 
 func countDec*[T](arc: Arc[T]): int32 =
-  assert arc.get().refc.fetchSub(1'i32) >= 0
+  result = arc.get().refc.fetchSub(1'i32)
+  assert result >= 0
 
 func inspectRefc*[T](arc: Arc[T]): int32 =
   arc.get().refc.load()
@@ -43,6 +47,10 @@ func `=move`*[T](
   src: Arc[T]
 ) {.error: "Arc[T] can be only copied, sinked, or destroyed".}
 
-func `=destroy`*[T](arc: Arc[T]) =
-  if not arc.get().isNil():
-    discard arc.countDec()
+func `=dup`*[T](
+  src: Arc[T]
+): Arc[T] {.error: "Arc[T] can be only copied, sinked, or destroyed".}
+
+proc `=destroy`*[T](arc: Arc[T]) =
+  if not arc.get().isNil() and arc.countDec() == 1:
+    dealloc(arc.get)

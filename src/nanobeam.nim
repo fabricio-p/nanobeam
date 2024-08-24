@@ -1,93 +1,14 @@
-import macros, tables, hashes, sugar, os, random
+import macros, tables, hashes, sugar, os, random, strformat
 
 import yarolin/options
 import fusion/matching
 
-import ./nanobeam/[io, string_view, arc, mutex]
+import ./nanobeam/[io, string_view, arc, mutex, max_seq, array_views, atom]
 
 {.experimental: "caseStmtMacros".}
 
 type
-  MaxSeqObj[T] = object
-    cap, len: Natural
-    data: UncheckedArray[T]
-
-  MaxSeq[T] = distinct ptr MaxSeqObj[T]
-
-template align(x, alignment: int): int =
-  (x + alignment - 1) and not (alignment - 1)
-
-func get[T](ms: MaxSeq[T]): ptr MaxSeqObj[T] = (ptr MaxSeqObj[T]) ms
-
-func initMaxSeqInplace*[T](s: var MaxSeq[T], cap: int) =
-  s.get.cap = cap
-  s.get.len = 0
-
-proc newMaxSeqOfCap*[T](cap: int = 8, shared: static[bool] = true): MaxSeq[T] =
-  let
-    cap = align(cap, 8)
-    size = sizeof(MaxSeqObj[T].cap) + sizeof(MaxSeqObj[T].len) + cap * sizeof(T)
-  when shared:
-    result = MaxSeq[T](
-      cast[ptr MaxSeqObj[T]](createShared(uint8, size))
-    )
-  else:
-    result = MaxSeq[T](
-      cast[ptr MaxSeqObj[T]](create(uint8, size))
-    )
-  result.get.cap = cap
-
-proc newMaxSeq*[T](len: int, shared: static[bool] = true): MaxSeq[T] =
-  result = newMaxSeqOfCap[T](len, shared)
-  result.get.len = len
-
-func len*(ms: MaxSeq[auto]): int = ms.get.len
-func low*(ms: MaxSeq[auto]): int = 0
-func high*(ms: MaxSeq[auto]): int = ms.get.len - 1
-
-template toOpenArray*[T](ms: MaxSeq[T]): openArray[T] =
-  bind MaxSeq
-  bind get
-  ms.get.data.addr.toOpenArray(0, ms.high.int)
-
-func `[]`*[T](ms: var MaxSeq[T], i: int): var T =
-  assert i < ms.len
-  ms.get.data[i]
-
-func `[]=`*[T](ms: var MaxSeq[T], i: int, value: T) =
-  assert i < ms.len
-  ms.get.data[i] = value
-
-func add*[T](ms: var MaxSeq[T], item: T) =
-  assert ms.len < ms.cap
-  ms.get.data[ms.get.len] = item
-  inc ms.get.len
-
-iterator items*[T](ms: MaxSeq[T]): T =
-  var i = 0
-  while i < ms.len:
-    yield ms.get.data[i]
-    inc i
-
-iterator mitems*[T](ms: var MaxSeq[T]): var T =
-  var i = 0
-  while i < ms.len:
-    yield ms[i]
-    inc i
-
-iterator pairs*[T](ms: MaxSeq[T]): (Natural, T) =
-  var i = 0
-  while i < ms.len:
-    yield (i, ms[i])
-    inc i
-
-iterator mpairs*[T](ms: var MaxSeq[T]): tuple[index: Natural, val: var T] =
-  var i = 0.Natural
-  while i < ms.len:
-    yield (i, ms[i])
-    inc i
-
-type
+  Register = distinct uint16
   OpCode {.size: sizeof(uint8).} = enum
     LoadI
     LoadF
@@ -97,47 +18,77 @@ type
     Mul
     Div
 
+    Return
     Print
+
   Instruction = object
-    res: uint8
+    res: Register
     case opcode: OpCode
     of LoadI:
       valuei: BiggestInt
     of LoadF:
       valuef: BiggestFloat
     of Add..Div:
-      op1: uint8
-      op2: uint8
-    else:
+      op1, op2: Register
+    of Return, Print:
       discard
 
-  TermKind {.size: sizeof(uint8).} = enum
+  TermKind {.size: sizeof(uint8), pure.} = enum
+    Atom
     Int
     Float
+    Cons
+    Null
+    Tuple
+    Function
 
   Term = object
     case kind: TermKind
+    of Atom:
+      atom: Atom
     of Int:
       int: BiggestInt
     of Float:
       float: BiggestFloat
-
-  AtomValue = StringView
-  AtomDesc = distinct int
-  Atom = distinct uint32
+    of Cons:
+      car, cdr: ptr Term
+    of Null:
+      discard
+    of Tuple:
+      items: MaxSeq[Term]
+    of Function:
+      fn: MFA
 
   PID = distinct uint32
 
+  NaF = proc(env: var Env, process: var Process): bool {.cdecl.}
+
+  FunctionKind {.size: sizeof(uint8).} = enum
+    None, Native, Normal
+
   Function = object
-    code: Slice[int]
+    case kind: FunctionKind
+    of Normal:
+      code: Slice[int]
+    of Native:
+      naf: NaF
+    of None:
+      discard
+
+  AtomArityPair = tuple[arity: int, name: Atom]
 
   Module = object
     name: Atom
     atomNames: seq[string]
-    functions: RWMutex[Table[Atom, Function]]
+    functions: RWMutex[Table[AtomArityPair, Function]]
+
+  MFA = object
+    m, f: Atom
+    a: uint16
+    anonymous: bool
 
   Process {.byref.} = object
-    memory: Slice[pointer]
+    memory: ArrayView[Term]
     hTop, sTop: ptr Term
     fcalls: int32
     heap: Slice[ptr Term]
@@ -145,9 +96,13 @@ type
     pc: ptr Instruction
     reductions: uint
     uniq: int64
-    # xRegs: ptr array[0..999, Term]
-    # yRegs: ptr MaxSeq[Term]
-    # 
+    x0: Term
+    xRegs: ArrayView[Term]
+
+  ProcessOpts = object
+    fn: MFA
+    memorySize: int = 500
+    numX: int = 64
 
   Scheduler = object
     env: ptr Env
@@ -162,15 +117,30 @@ type
     procTable: RWMutex[Table[PID, Arc[Process]]]
     atomTable: RWMutex[Table[AtomDesc, Atom]]
 
-func hash(pid: PID): Hash {.borrow.}
-func hash(pid: AtomDesc): Hash {.borrow.}
+func hash*(pid: PID): Hash {.borrow.}
+
+func default(_: typedesc[Function]): Function = Function(kind: None)
+
+func x(_: typedesc[Register], n: uint16): Register {.inline.} = Register(n)
+func y(_: typedesc[Register], n: uint16): Register {.inline.} =
+  Register(n or (1'u16 shl 15))
+
+func isX(r: Register): bool = ((1'u16 shl 15) and uint16(r)) == 0
+func n(r: Register): int = int(uint16(r) and not (1'u16 shl 15))
+
+template X(n: uint16): Register =
+  bind Register
+  Register.x(n)
+template Y(n: uint16): Register =
+  bind Register
+  Register.y(n)
 
 proc schedulerLoop(scheduler: ptr Scheduler) {.thread.} =
   for i in 0..<10:
     # let process = scheduler.env.queue.recv[:Arc[Process]]()
     # discard process
     {.cast(gcsafe).}:
-      stdout.write("[" & $scheduler.id & "]: " & $i & Endl)
+      cerr.done("[" & $scheduler.id & "]: " & $i & Endl)
     sleep(rand(200..1000))
 
 proc init(env: var Env, numSchedulers: Natural, maxProcesses: Natural = 0) =
@@ -190,6 +160,18 @@ proc init(env: var Env, numSchedulers: Natural, maxProcesses: Natural = 0) =
 
 proc runUntilEnd(env: var Env) =
   joinThreads(env.schedulerThreads.toOpenArray())
+
+proc makeProcess(env: var Env, opts: ProcessOpts): ?PID =
+  result = none(PID)
+  let
+    pid = PID(env.pidCounter)
+    memoryPtr = createShared(Term, opts.memorySize)
+    xRegsPtr = createShared(Term, opts.numX)
+
+  var process = Arc.newUnsafe[:Process]()
+  # initializing the thing in-place
+  process[].memory = ArrayView.new(memoryPtr, opts.memorySize)
+  process[].xRegs = ArrayView.new(xRegsPtr, opts.numX)
 
 template genTermOperation(name: untyped, operator: untyped): untyped =
   bind TermKind
@@ -248,18 +230,29 @@ proc execute(env: var Env, instr: Instruction) =
 
 proc main() =
   let program = @[
-    Instruction(opcode: OpCode.LoadI, res: 0, valuei: 100),
-    Instruction(opcode: OpCode.LoadI, res: 1, valuei: 200),
-    Instruction(opcode: OpCode.Add, res: 0, op1: 0, op2: 1),
-    Instruction(opcode: OpCode.Print, res: 0),
-    Instruction(opcode: OpCode.LoadF, res: 0, valuef: 10'f64),
-    Instruction(opcode: OpCode.LoadF, res: 1, valuef: 3'f64),
-    Instruction(opcode: OpCode.Div, res: 0, op1: 0, op2: 1),
-    Instruction(opcode: OpCode.Print, res: 0),
+    Instruction(opcode: OpCode.LoadI, res: 0.X, valuei: 100),
+    Instruction(opcode: OpCode.LoadI, res: 1.X, valuei: 200),
+    Instruction(opcode: OpCode.Add, res: 0.X, op1: 0.X, op2: 1.X),
+    Instruction(opcode: OpCode.Print, res: 0.X),
+    Instruction(opcode: OpCode.LoadF, res: 0.X, valuef: 10'f64),
+    Instruction(opcode: OpCode.LoadF, res: 1.X, valuef: 3'f64),
+    Instruction(opcode: OpCode.Div, res: 0.X, op1: 0.X, op2: 1.X),
+    Instruction(opcode: OpCode.Print, res: 0.X),
   ]
   var env: Env
   env.init(2)
   env.runUntilEnd()
 
+func doStuff(x: Arc[int], y: var Arc[int]) =
+  dump x[]
+  y = x
+  y[] += 22
+
 when isMainModule:
+  var
+    a = Arc.new(20)
+    b: Arc[int]
+  doStuff(a, b)
+  dump (a, b)
+  dump (a[], b[])
   main()
